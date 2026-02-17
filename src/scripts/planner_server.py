@@ -2,8 +2,10 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped
+from nav2_msgs.action import FollowPath
 import numpy as np
 import math
 import heapq
@@ -35,6 +37,8 @@ class PlannerServer(Node):
         self.gvd_pub   = self.create_publisher(Path, '/path_gvd', path_qos)
         self.marker_pub = self.create_publisher(Marker,'/planner_markers',10)
 
+        self.follow_path_client = ActionClient(self, FollowPath, '/follow_path')
+
         self.map_received = False
         self.get_logger().info("Planner server started")
 
@@ -56,8 +60,8 @@ class PlannerServer(Node):
         grid[grid != 0] = 1   # 1 = occupied, 0 = free
 
         # Start and goal
-        start_world = (0.7, 2.3)
-        goal_world  = (0.5, -0.2)
+        start_world = (0.0, 0.0)
+        goal_world  = (-1.2, 0.44)
 
         start = self.world_to_grid(start_world)
         goal  = self.world_to_grid(goal_world)
@@ -95,6 +99,7 @@ class PlannerServer(Node):
         if astar_path:
             self.publish_path(astar_path, self.astar_pub)
             self.get_logger().info("A* path published")
+            self.send_follow_path(astar_path)
 
         if gvd_path:
             self.publish_path(gvd_path, self.gvd_pub)
@@ -230,6 +235,49 @@ class PlannerServer(Node):
             msg.poses.append(p)
 
         pub.publish(msg)
+
+    def send_follow_path(self, grid_path):
+        """Send the A* path to Nav2 controller via FollowPath action."""
+        if not self.follow_path_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().warn('Nav2 follow_path action server not available')
+            return
+
+        path_msg = Path()
+        path_msg.header.frame_id = 'map'
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        for x, y in grid_path:
+            p = PoseStamped()
+            p.header.frame_id = 'map'
+            p.header.stamp = path_msg.header.stamp
+            p.pose.position.x = self.origin_x + (x + 0.5) * self.res
+            p.pose.position.y = self.origin_y + (y + 0.5) * self.res
+            p.pose.position.z = 0.0
+            p.pose.orientation.w = 1.0
+            path_msg.poses.append(p)
+
+        goal = FollowPath.Goal()
+        goal.path = path_msg
+        self.get_logger().info('Sending A* path to Nav2 controller')
+        future = self.follow_path_client.send_goal_async(
+            goal, feedback_callback=self._follow_feedback_cb)
+        future.add_done_callback(self._follow_response_cb)
+
+    def _follow_response_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Nav2 follow_path goal rejected')
+            return
+        self.get_logger().info('Nav2 follow_path goal accepted')
+        goal_handle.get_result_async().add_done_callback(self._follow_result_cb)
+
+    def _follow_feedback_cb(self, feedback_msg):
+        fb = feedback_msg.feedback
+        if hasattr(fb, 'distance_to_goal'):
+            self.get_logger().info(f'Distance to goal: {fb.distance_to_goal:.2f} m')
+
+    def _follow_result_cb(self, future):
+        status = future.result().status
+        self.get_logger().info(f'Nav2 follow_path finished with status {status}')
 
     def publish_point_marker(self, x, y, marker_id, r, g, b):
         marker = Marker()
